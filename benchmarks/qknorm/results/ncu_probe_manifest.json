@@ -1,0 +1,111 @@
+{
+  "ropeacc_bubble_fix_regprobe": {
+    "job": "yffeng-qknorm-ropeacc-regprobe-0921-175031",
+    "status": "Succeeded (SO linked+copied, integrity PASS, 0 spill)",
+    "edit": "no_pipeline QK_NORM branch only: RoPE tile issued into own accumulator rP_rope BEFORE warpgroup_wait<0>, then rP = rP*alpha^k + rP_rope. Pipelined sites (325/356) NOT yet edited.",
+    "regs": {"baseline_Lb0E": 240, "qknorm_Lb1E_with_rP_rope": 242, "spill_bytes": 0, "wall": 256},
+    "key_finding": "rP_rope adds ZERO net registers vs the accepted 242-reg <T,true> kernel. Register wall is NOT the blocker for the no_pipeline site. BUT: 242==242 means the no_pipeline function is NOT the reg-limiting site; peak liveness lives in the steady-state pipelined subroutines (wg0/wg1). The pipelined bubble fix (sites 325/356) is UNTESTED for regs and is the one that actually runs in steady state / owns the perf win.",
+    "integrity": "PASS bit-exact (alpha=ones) + PASS rank-1 equivalence h_q=24",
+    "cuobjdump_note": "cuobjdump absent from env bin; register data taken from ptxas -v in build.log instead (authoritative, same numbers).",
+    "verdict": "Register wall does not veto the fix. Next gating question is regs+perf of the PIPELINED-site edit, whose upside per prior ncu probe is bounded to short ctx (4k-16k); long ctx already <2% on paper denominator."
+  },
+  "ropeacc_bubble_fix_PIPELINED_regprobe": {
+    "job": "yffeng-qknorm-ropeacc-regprobe-0921-183027",
+    "status": "Succeeded build; DECISIVE NEGATIVE - spills.",
+    "edit": "Extended rP_rope bubble fix to BOTH steady-state pipelined sites (PHASE1 line ~325, PHASE2 line ~356): tile-8 RoPE GEMM routed into own rP_rope accumulator via new QKT_GEMM_TILE8_INTO macro, issued BEFORE warpgroup_wait<0>, then rP = rP*alpha^k + rP_rope. Baseline <T,false> untouched (make_fragment_like inside if constexpr(QK_NORM)).",
+    "regs": {"baseline_Lb0E_bf16_fp16": 240, "qknorm_Lb1E_bf16_fp16": 255, "spill_bytes": {"stack_frame": 16, "spill_stores": 20, "spill_loads": 20}, "wall": 255},
+    "key_finding": "In the STEADY-STATE loop, rP_rope(32 floats) live alongside rO(128)+rP(32) = 192-float accumulator peak pushes <T,true> to the 255-reg __launch_bounds__ ceiling and SPILLS 20 bytes to local memory. The accepted (no-bubble-fix) <T,true> is 242 regs / 0 spill. Confirms the drain->scale->RoPE bubble is REGISTER-BOUND in the pipelined path: giving RoPE its own accumulator is not schedulable without spilling, which in a decode-hot loop costs more than the bubble it removes.",
+    "contrast_no_pipeline": "The no_pipeline-only edit stayed at 242/0-spill because that prologue function is NOT the reg-limiting site; the pipelined subroutines are. So the +0-reg result there was misleading for the real path - now corrected.",
+    "decision": "Per user's pre-agreed rule ('if RoPE-own-accumulator tops >255 regs, that IS a clean conclusion, do not waste a formal run'), STOPPED before formal. Reverted kernel to /tmp/splitkv_mla.cuh.accepted-rearch.bak (verified byte-identical). Accepted re-arch (242-reg, ~4% over attention-core / <2% long-ctx paper-denominator) stands as the practical optimum.",
+    "verdict": "The paper's <2% is NOT reachable by eliminating the bubble via a second score accumulator on this SM90 kernel: the register budget under __launch_bounds__(256,1,1) has no room for a 32-float RoPE sidecar accumulator in steady state. Bubble is register-bound, not schedule-bound."
+  },
+  "task": "qknorm-mla-decode-ncu-profile",
+  "lane": "measurement-only",
+  "goal": "Step C of C->A->B: profile FlashMLA dense-decode qk-norm kernel on H200 to attribute the ~16% mean overhead (vs paper's <2% claim) to occupancy / register pressure / DRAM traffic, before attempting any optimization.",
+  "kernel": "flash_fwd_splitkv_mla_kernel<T, QK_NORM, TmaParams> (csrc/sm90/decode/dense/splitkv_mla.cuh:1067)",
+  "toggle_semantics": "baseline = <T,false> (qk_norm_scale_ptr==nullptr); qk-norm = <T,true>: per-token per-q-head float32 scale __ldg-loaded and multiplied into content-part QK^T score (splitkv_mla.cuh:42-57); host selects instance at 1450-1452.",
+  "sidecar": "qk_norm_scale_cache shape (num_blocks, block_size, h_q) float32; multiplies ONLY content dims (first 512), not RoPE (last 64).",
+  "flashmla_head": "9241ae3ef9bac614dd25e45e507e089f888280e0",
+  "ncu": "nsight-compute-2026.2.1 (/mnt/shared-storage-gpfs2/plm-gpfs/yffeng/nsight-compute-2026.2.1/ncu), host+target linux-desktop-glibc_2_11_3-x64",
+  "sections": ["SpeedOfLight", "Occupancy", "LaunchStats", "MemoryWorkloadAnalysis"],
+  "capture": "torch.cuda.profiler.start/stop around ONE post-warmup launch; ncu --profile-from-start off -k regex:flash_fwd_splitkv_mla_kernel --launch-count 1",
+  "integrity_gate": "before profiling: all outputs finite; qk-norm(scale=ones)==baseline within FlashMLA test tol (out rtol=2.01/128 atol=8e-4, lse rtol=8.01/65536 atol=1e-6); random scale in [0.5,1.5] finite.",
+  "config": {"h_q": 24, "h_kv": 1, "d_content": 512, "d_rope": 64, "dv": 512, "block_size": 64, "dtype": "bf16", "causal": true},
+  "smoke_shapes": [[4096, 1]],
+  "formal_shapes": [[16384, 8], [16384, 4], [4096, 32], [4096, 128], [16384, 1]],
+  "shape_rationale": "16k/b8=23.0% (worst), 16k/b4=22.7%, 4k/b32=21.7% high-overhead; 4k/b128 bandwidth-saturated (base 3626 GB/s); 16k/b1=1.01% low-overhead contrast.",
+  "accepted_baseline_run": "results/qknorm-module-0920-162535 (mean overhead 16.34%, geomean base 1833 GB/s, qk 1578 GB/s)",
+  "harness": "profile_qknorm_ncu.py",
+  "submit": "submit_qknorm_ncu_rjob.sh",
+  "smoke_job": "yffeng-qknorm-ncu-smoke-0920-170859",
+  "smoke_output_dir": "results/ncu-0920-170859",
+  "smoke_result": {
+    "status": "PASS",
+    "gpu_counter_permission": "OK (11 passes, no ERR_NVGPUCTRPERM)",
+    "integrity": "INTEGRITY_OK both paths (finite + qk_norm(ones)==baseline)",
+    "shape_4096_b1": {
+      "base": {"dur_us": 14.016, "regs": 240, "sm_pct": 4.18, "dram_pct": 7.18, "warps_active_pct": 11.42, "grid": 132, "waves": 1},
+      "qk": {"dur_us": 17.504, "regs": 254, "sm_pct": 3.72, "dram_pct": 6.23, "warps_active_pct": 11.76, "grid": 132, "waves": 1},
+      "note": "batch=1 is work-starved/latency-bound (DRAM 6-7%, SM 4%, occ ~11%, 1 wave). ncu pure-kernel overhead +24.9% here vs do_bench 3.07% (do_bench diluted by fixed launch overhead on a 14us kernel). Registers 240->254 confirms <T,true> is a heavier compiled instance."
+    }
+  },
+  "formal_job": "yffeng-qknorm-ncu-0920-172037",
+  "formal_output_dir": "results/ncu-0920-172037",
+  "formal_added_metrics": "dram__bytes.sum,dram__bytes_read.sum,dram__bytes_write.sum,lts__t_sectors.sum,l1tex__t_sectors.sum",
+  "formal_result": {
+    "status": "Succeeded, 10/10 reports, 10x INTEGRITY_OK, no NCU_FAILED",
+    "invariants": "ALL shapes: registers base=240 qk=254; grid=132 (=SM count); waves/SM=1; achieved warps active ~12% (both paths) -> occupancy is DESIGN-capped (launch_bounds 1 block/SM + large smem, warp-specialized TMA persistent kernel ~8 warps/SM=12.5%), NOT register-limited; 240->254 does not lower occupancy.",
+    "per_shape": {
+      "c16384_b1": {"base_MB": 19.00, "qk_MB": 20.73, "dbytes_pct": 9.08, "dur_base_us": 17.98, "dur_qk_us": 21.57, "ovhd_pct": 19.9, "base_dram_pct": 21.99, "qk_dram_pct": 19.98, "base_sm_pct": 12.75, "qk_sm_pct": 10.57},
+      "c16384_b4": {"base_MB": 77.39, "qk_MB": 83.68, "dbytes_pct": 8.12, "dur_base_us": 37.86, "dur_qk_us": 44.32, "ovhd_pct": 17.1, "base_dram_pct": 42.49, "qk_dram_pct": 39.26, "base_sm_pct": 24.94, "qk_sm_pct": 21.19},
+      "c16384_b8": {"base_MB": 152.98, "qk_MB": 165.60, "dbytes_pct": 8.25, "dur_base_us": 54.02, "dur_qk_us": 67.36, "ovhd_pct": 24.7, "base_dram_pct": 58.90, "qk_dram_pct": 51.13, "base_sm_pct": 34.84, "qk_sm_pct": 28.01},
+      "c4096_b32": {"base_MB": 153.64, "qk_MB": 166.28, "dbytes_pct": 8.22, "dur_base_us": 53.09, "dur_qk_us": 67.20, "ovhd_pct": 26.6, "base_dram_pct": 60.18, "qk_dram_pct": 51.45, "base_sm_pct": 35.44, "qk_sm_pct": 28.11},
+      "c4096_b128": {"base_MB": 609.32, "qk_MB": 659.96, "dbytes_pct": 8.31, "dur_base_us": 158.14, "dur_qk_us": 188.90, "ovhd_pct": 19.4, "base_dram_pct": 80.09, "qk_dram_pct": 72.62, "base_sm_pct": 51.15, "qk_sm_pct": 41.57}
+    },
+    "causal_decomposition": "qk-norm adds a stable +8.1..9.1% DRAM bytes (fp32 per-token-per-head scale sidecar), but wall-clock overhead is 17-27% (>bytes). The extra 9-18% is NOT bytes: both SM% and DRAM% DROP in qk path (effective bandwidth falls), signature of added STALL from the dependent per-token __ldg scale load + multiply inserted into the QK^T warpgroup-gemm pipeline, poorly hidden because occupancy is design-capped at ~12% (8 warps/SM) so there is little warp-parallelism to cover the extra dependent-load latency.",
+    "levers_implied": "(1) shrink scale dtype fp32->bf16 (~-4% bytes) or ->fp8 (~-6% bytes): directly removes the ~8% byte component. (2) prefetch scale into smem/regs off the QK^T critical path, or switch per-head sidecar to paper's per-KV-group scalar (cuts #loads by ~H_Q=24x): attacks the ~9-18% stall component. Reaching paper's <2% likely needs BOTH; matches paper's 'best fused into the attention-score kernel'."
+  },
+  "status": "step C (profiling) COMPLETE and accepted; ready for step A (same-code H800 vs H200 A/B) then B (dtype/fusion opt).",
+  "warp_stall_probe": {
+    "purpose": "Direct evidence for the drain->scale->RoPE bubble on the CURRENT re-arch kernel (per-token dedup rank-1 sidecar, ~4% full-layer overhead), NOT the old per-head 16% version the entries above measured. Question being answered: is the residual qk-norm overhead dominated by warpgroup_wait<0> pipeline stall (Stall Barrier/Wait/Short-Scoreboard) rather than DRAM bytes? Determines whether the register-costly RoPE-own-accumulator fix is worth pursuing to reach the paper's <2%.",
+    "kernel_structure_confirmed": "splitkv_mla.cuh:311-331. baseline <T,false> issues tiles 4,5,6,7,8,0,1,2,3 (RoPE tile 8 right after 7, no interior wait). qk-norm <T,true> issues 8 content tiles (4,5,6,7,0,1,2,3), prefetch alpha^k, warpgroup_wait<0> (drains ALL content GEMM), apply scale, THEN issues RoPE tile 8. Prefetch (line 319) issues sidecar loads before the wait but the wait blocks on the WGMMA scoreboard, not the load -> load latency cannot fill the drain bubble ('prefetch null').",
+    "added_sections": ["WarpStateStats", "SchedulerStats"],
+    "added_stall_metrics": ["smsp__average_warps_issue_stalled_barrier_per_issue_active.ratio", "smsp__average_warps_issue_stalled_wait_per_issue_active.ratio", "smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active.ratio", "smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio"],
+    "heads": 16,
+    "config_change_vs_above": "H_Q 24->16 (DeepSeek-V3 MLA local heads at TP=8, matching the accepted full-layer harness). Kernel tile structure is H_Q-independent (BLOCK_SIZE_M=64 padded), so the bubble mechanism is unaffected; 16 is chosen for consistency with the accepted result.",
+    "smoke_shape": [[4096, 4]],
+    "formal_shapes": [[4096, 4], [16384, 4], [65536, 4]],
+    "shape_rationale": "batch=4 per paper; short ctx (4k) = worst overhead % (fixed bubble / small denom), long ctx (64k) = attention-dominated. Tests whether the qk-norm stall excess is a near-constant cycle count across ctx (bubble signature) vs scaling with ctx (bytes signature).",
+    "harness": "profile_qknorm_ncu.py (revised: --heads param, default 16)",
+    "submit": "submit_qknorm_ncu_rjob.sh (revised: +WarpStateStats/SchedulerStats, PRIORITY default 7, batch=4 shapes)",
+    "smoke_job": "yffeng-qknorm-ncustall-smoke-0921-170311",
+    "smoke_result": {
+      "status": "PASS (succeeded=1, SUCCEED replica)",
+      "counter_permission": "OK (19 passes, no ERR_NVGPUCTRPERM)",
+      "integrity": "INTEGRITY_OK both paths (finite + qk_norm(ones)==baseline within tol)",
+      "stall_metrics_landed": true,
+      "c4096_b4": {"dur_base_us": 19.168, "dur_qk_us": 21.952, "ovhd_pct": 14.5, "regs_base": 240, "regs_qk": 242, "occ_base_pct": 12.27, "occ_qk_pct": 13.10, "stall_barrier_base": 4.202, "stall_barrier_qk": 5.058, "stall_wait_base": 1.137, "stall_wait_qk": 1.088, "stall_shortsb_base": 0.154, "stall_shortsb_qk": 0.149, "stall_longsb_base": 3.186, "stall_longsb_qk": 3.319, "dram_MB_base": 19.05, "dram_MB_qk": 19.13},
+      "preliminary_read": "byte cost negligible (+0.4%, re-arch killed old +8-9% sidecar); overhead concentrates in Stall Barrier (+20%), where warpgroup_wait<0> lands. Formal ctx sweep needed to separate fixed-bubble from memory-scaling.",
+      "smoke_output_dir_deleted": "results/ncu-0921-170311 (formal regenerates the 4k/b4 shape)"
+    },
+    "formal_job": "yffeng-qknorm-ncustall-0921-170942",
+    "formal_output_dir": "results/ncu-0921-170942",
+    "result": {
+      "status": "Succeeded, 6/6 reports, 6x INTEGRITY_OK, 0 NCU_FAILED, DONE marker set",
+      "per_shape": {
+        "c4096_b4": {"dur_base_us": 18.53, "dur_qk_us": 22.30, "d_us": 3.78, "ovhd_pct": 20.4, "barrier_base": 4.16, "barrier_qk": 5.02, "wait_base": 1.14, "wait_qk": 1.09, "longsb_base": 3.23, "longsb_qk": 3.88, "dram_pct": 0.4, "regs": "240->242", "occ": "11.9->11.6"},
+        "c16384_b4": {"dur_base_us": 38.43, "dur_qk_us": 40.29, "d_us": 1.86, "ovhd_pct": 4.8, "barrier_base": 2.59, "barrier_qk": 2.73, "wait_base": 1.08, "wait_qk": 1.03, "longsb_base": 6.00, "longsb_qk": 5.98, "dram_pct": 0.7, "regs": "240->242", "occ": "11.7->12.2"},
+        "c65536_b4": {"dur_base_us": 84.42, "dur_qk_us": 95.90, "d_us": 11.49, "ovhd_pct": 13.6, "barrier_base": 1.80, "barrier_qk": 1.59, "wait_base": 1.01, "wait_qk": 0.99, "longsb_base": 5.12, "longsb_qk": 5.61, "dram_pct": 0.4, "regs": "240->242", "occ": "12.7->12.5"}
+      },
+      "findings": {
+        "bytes_dead": "DRAM byte cost +0.4-0.7% across ALL ctx. The re-arch (per-token dedup rank-1 sidecar) fully eliminated the old per-head-fp32 +8-9% byte component. Overhead is NOT bytes.",
+        "short_ctx_bubble": "At 4k the Barrier stall (where warpgroup_wait<0> WGMMA-scoreboard drain lands) is clearly elevated (4.16->5.02, +0.86, the largest relative bump) and 4k has the worst overhead% (20.4%). This is the drain->scale->RoPE bubble, exposed because 4k is latency-bound (occ ~12%, few blocks to amortize).",
+        "long_ctx_not_bubble": "At 64k the Barrier stall per-issue is NOT elevated (1.80->1.59, DROPS) yet Δ=+11.49µs (+13.6%). So the long-ctx excess is NOT a single fixed drain bubble; it is dominated by cumulative per-block apply_qk_content_scales FMA compute (once per KV block, ~256 blocks/batch at 64k) plus slightly worse memory-latency hiding (LongSB 5.12->5.61). This is issued work, not a barrier stall.",
+        "non_monotonic_delta": "Absolute Δµs is non-monotonic (3.78, 1.86, 11.49); 16k is the low point. Indicates split-KV scheduling / tail-wave balance interacts with ctx; overhead is not a clean fixed-per-launch or fixed-per-block constant.",
+        "register_recount": "CURRENT qk-norm kernel is 242 regs (baseline 240) -> only +2, and 13 below the 255 wall. The memory note's '+32 -> 274 > 255 wall' was for an OLDER, heavier design, NOT this re-arch. So a RoPE-only second accumulator (RoPE is 1 of 9 tiles = 64 cols, far smaller than the 512-col content accumulator) MIGHT fit under 255 without touching baseline <T,false>. This REOPENS the structural fix as testable rather than blocked -- but must be confirmed by an actual build + static reg check, not asserted."
+      },
+      "verdict_on_solving_bubble": "Solving the drain bubble (RoPE own accumulator so RoPE tile 8 overlaps the content drain) would primarily help SHORT ctx (4k-16k), where the barrier stall dominates and where overhead% is worst. It would NOT close the long-ctx excess (that is scale-apply compute, not a barrier stall). Mapped to denominators: on the paper's torch.compile denominator we are ALREADY <2% for ctx>=32k (prior full-layer mean 2.19%); the residual short-ctx gap is exactly where the bubble fix would bite. So the bubble is the key to the SHORT-ctx / FlashMLA-denominator gap, and is worth a build-test attempt now that regs are only 242 -- but it is NOT the whole story at long ctx, and the paper-denominator long-ctx target is already met.",
+      "cleanup": "smoke dir results/ncu-0921-170311 deleted; formal dir results/ncu-0921-170942 retained as accepted evidence. Measurement-only: no W&B."
+    }
+  }
+}

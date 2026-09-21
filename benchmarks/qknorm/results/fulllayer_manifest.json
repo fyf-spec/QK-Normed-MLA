@@ -1,0 +1,98 @@
+{
+  "task": "qknorm-mla-fulllayer-decode-benchmark",
+  "lane": "measurement-only",
+  "methodology": "paper arXiv 2606.16310 v1 \u00a75.3: full MLA layer, BF16, decode step over prefilled cache, overhead over full-layer time",
+  "config": {
+    "dim": 7168,
+    "q_lora": 1536,
+    "kv_lora": 512,
+    "n_heads": 16,
+    "nope": 128,
+    "rope": 64,
+    "v_head": 128,
+    "softmax_scale": 0.07216878364870322,
+    "dtype": "bfloat16",
+    "batch": 4,
+    "tp": 8
+  },
+  "backends": {
+    "torch": "pure-PyTorch absorbed decode, torch.compile(reduce-overhead)",
+    "flashmla": "FlashMLA <T,false> dense kernel, CUDA-graph replay",
+    "qknorm": "FlashMLA <T,true> + alpha^k RMS-stat write, CUDA-graph replay"
+  },
+  "primary_metric": "qk_over_flash_pct (isolates qk-norm integration; counts none of FlashMLA baseline speedup as gain)",
+  "gate": {
+    "passed": true,
+    "max_abs_diff": 0.0,
+    "rel": 0.0,
+    "tol": 0.02
+  },
+  "qk_over_flash_pct": {
+    "min": 5.7001562799307015,
+    "max": 9.422174654805616,
+    "mean": 7.530354562956778
+  },
+  "smoke": false,
+  "rows": [
+    {
+      "ctx": 4096,
+      "torch_ms": 0.1748100535210887,
+      "flash_ms": 0.1419775083233587,
+      "qk_ms": 0.15335010881020553,
+      "qk_over_flash_pct": 8.010142325462798,
+      "flash_over_torch_pct": -18.78184036696101
+    },
+    {
+      "ctx": 8192,
+      "torch_ms": 0.3255212496733293,
+      "flash_ms": 0.14885912895454664,
+      "qk_ms": 0.16083939012657902,
+      "qk_over_flash_pct": 8.048052716800779,
+      "flash_over_torch_pct": -54.27053407298865
+    },
+    {
+      "ctx": 16384,
+      "torch_ms": 0.5767370354744696,
+      "flash_ms": 0.16233276389957813,
+      "qk_ms": 0.1749512624021963,
+      "qk_over_flash_pct": 7.773229629986589,
+      "flash_over_torch_pct": -71.85324438788115
+    },
+    {
+      "ctx": 32768,
+      "torch_ms": 1.0668884625380066,
+      "flash_ms": 0.17852467636843233,
+      "qk_ms": 0.19534558317779252,
+      "qk_over_flash_pct": 9.422174654805616,
+      "flash_over_torch_pct": -83.26679098734067
+    },
+    {
+      "ctx": 65536,
+      "torch_ms": 2.035123051481044,
+      "flash_ms": 0.21444991695847684,
+      "qk_ms": 0.22984595845871308,
+      "qk_over_flash_pct": 7.179318005153301,
+      "flash_over_torch_pct": -89.46255771598614
+    },
+    {
+      "ctx": 131072,
+      "torch_ms": 3.915406084060669,
+      "flash_ms": 0.2826780688146065,
+      "qk_ms": 0.3012766132172007,
+      "qk_over_flash_pct": 6.579408328557657,
+      "flash_over_torch_pct": -92.78036395853375
+    },
+    {
+      "ctx": 262144,
+      "torch_ms": 13.121380397251674,
+      "flash_ms": 0.41679538471194416,
+      "qk_ms": 0.44055337300806335,
+      "qk_over_flash_pct": 5.7001562799307015,
+      "flash_over_torch_pct": -96.82354011473333
+    }
+  ],
+  "gpu": "NVIDIA H200, 595.71.05",
+  "torch_version": "2.9.0+cu128",
+  "platform": "Linux-5.15.0-174-generic-x86_64-with-glibc2.35",
+  "timestamp": "2026-09-20T17:19:01.094265+00:00"
+}
