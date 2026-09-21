@@ -24,6 +24,76 @@ __forceinline__ __device__ int get_AorC_row_idx(int local_row_idx, int idx_in_wa
     return row_idx;
 }
 
+// QK-Normed MLA keeps the latent value c unchanged for PV, but its content
+// score is dot(q_absorbed, c) * rms_inv(W_k @ c).  The latter factor depends
+// on both the cached token and the query head, so it is stored in a sidecar
+// cache and applied to the accumulator after the 512 content dimensions and
+// before the final 64 RoPE dimensions are accumulated.
+//
+// Paper (arXiv 2606.16310) score-stage scaling, exact rank-1 form:
+//   L^c_{h,t} = L^{c,raw}_{h,t} * alpha^q_{h} * alpha^k_{t,g(h)}
+// For MLA the KV-group count G = 1, so alpha^k is a per-token scalar SHARED
+// across all q-heads -> sidecar is [block, token], NOT [block, head, token].
+// The per-head query scalar alpha^q is folded into q_content by the caller
+// (paper: "absorbed into the query projection"), so the kernel applies only
+// the cached per-token alpha^k here.
+//
+// The application is split into a prefetch + apply pair so the sidecar global
+// loads can be ISSUED before the content-GEMM drain (cute::warpgroup_wait<0>)
+// and CONSUMED after it -> the ~400-cycle global-load latency overlaps the
+// drain bubble instead of serializing behind it.  Both "local rows" of the
+// rP fragment map to the SAME token_idx = (i/4)*8 + off (token_idx does not
+// depend on local_row_idx), so the two rows share ONE set of N = size(rP)/4
+// scale float2's; deduping them halves the sidecar __ldg count vs. loading
+// per (row, i).  Token is contiguous (row_stride == 1) so each of the two
+// adjacent token scales loads as ONE coalesced 8-byte float2.
+template<int N>
+struct QkContentScaleFrag {
+    float2 v[N];
+};
+
+// Prefetch phase: issue the N deduped sidecar loads.  Depends only on params /
+// block / thread index (NOT rP), so it is safe to call before warpgroup_wait.
+template<int N>
+__forceinline__ __device__ QkContentScaleFrag<N> prefetch_qk_content_scales(
+    const DenseAttnDecodeParams &params,
+    int physical_block_idx,
+    int idx_in_warpgroup
+) {
+    const float* block_scale = params.qk_norm_scale_ptr
+        + physical_block_idx * params.qk_norm_scale_block_stride;
+    QkContentScaleFrag<N> f;
+    CUTLASS_PRAGMA_UNROLL
+    for (int j = 0; j < N; ++j) {
+        int token_idx = j * 8 + idx_in_warpgroup % 4 * 2;
+        f.v[j] = __ldg(reinterpret_cast<const float2*>(block_scale + token_idx));
+    }
+    return f;
+}
+
+// Apply phase: multiply the prefetched alpha^k into the content accumulator.
+// Call AFTER cute::warpgroup_wait<0>() (rP must be resident and drained).
+template<int N, typename Engine0, typename Layout0>
+__forceinline__ __device__ void apply_qk_content_scales(
+    Tensor<Engine0, Layout0> &rP,
+    const QkContentScaleFrag<N> &f,
+    int idx_in_warpgroup
+) {
+    static_assert(N * 4 == decltype(cute::size(rP))::value,
+                  "QkContentScaleFrag size must match rP fragment (size(rP)/4)");
+    warpgroup_fence_operand(rP);
+    CUTLASS_PRAGMA_UNROLL
+    for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = local_row_idx ? 2 : 0; i < size(rP); i += 4) {
+            float2 s = f.v[i / 4];
+            rP(i) *= s.x;
+            rP(i + 1) *= s.y;
+        }
+    }
+    warpgroup_fence_operand(rP);
+}
+
 // Launch TMA copy for a range of KV tile
 // A tile has a shape of PAGE_BLOCK_SIZE (64) x 64
 template<
@@ -188,6 +258,7 @@ __forceinline__ __device__ void  qkt_gemm_one_tile_rQ(
 template<
     typename T, // Traits
     int PHASE_IDX,	// See comments in the code
+    bool QK_NORM,
     typename Engine0, typename Layout0,
     typename Engine1, typename Layout1,
     typename Engine2, typename Layout2,
@@ -200,6 +271,10 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
     Tensor<Engine3, Layout3> &rQ8,	// The 8-th tile of Q. We store it separately to leave some room for storing sP1
     TMABarrier* barriers,
     bool &cur_phase,
+    const DenseAttnDecodeParams &params,
+    int physical_block_idx,
+    int m_block_idx,
+    int k_head_idx,
     int idx_in_warpgroup
 ) {
     Tensor sQ_tiled = flat_divide(sQ, Shape<Int<T::BLOCK_SIZE_M>, _64>{})(_, _, _0{}, _);	// (BLOCK_SIZE_M, 64, 9)
@@ -233,11 +308,27 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
         QKT_GEMM_ONE_TILE(5);
         QKT_GEMM_ONE_TILE(6);
         QKT_GEMM_ONE_TILE(7);
-        QKT_GEMM_ONE_TILE(8);
-        QKT_GEMM_ONE_TILE(0);
-        QKT_GEMM_ONE_TILE(1);
-        QKT_GEMM_ONE_TILE(2);
-        QKT_GEMM_ONE_TILE(3);
+        if constexpr (QK_NORM) {
+            QKT_GEMM_ONE_TILE(0);
+            QKT_GEMM_ONE_TILE(1);
+            QKT_GEMM_ONE_TILE(2);
+            QKT_GEMM_ONE_TILE(3);
+            // Issue sidecar alpha^k loads before draining the content GEMM so
+            // their global-load latency overlaps warpgroup_wait<0>.
+            constexpr int kQkN = decltype(size(rP))::value / 4;
+            auto qk_scales = prefetch_qk_content_scales<kQkN>(
+                params, physical_block_idx, idx_in_warpgroup
+            );
+            cute::warpgroup_wait<0>();
+            apply_qk_content_scales(rP, qk_scales, idx_in_warpgroup);
+            QKT_GEMM_ONE_TILE(8);
+        } else {
+            QKT_GEMM_ONE_TILE(8);
+            QKT_GEMM_ONE_TILE(0);
+            QKT_GEMM_ONE_TILE(1);
+            QKT_GEMM_ONE_TILE(2);
+            QKT_GEMM_ONE_TILE(3);
+        }
         cur_phase ^= 1;
     } else {
         // In PHASE-2, warpgroup 0 calculates Q K^T for the last 5 tiles
@@ -248,6 +339,14 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
         QKT_GEMM_ONE_TILE(5);
         QKT_GEMM_ONE_TILE(6);
         QKT_GEMM_ONE_TILE(7);
+        if constexpr (QK_NORM) {
+            constexpr int kQkN = decltype(size(rP))::value / 4;
+            auto qk_scales = prefetch_qk_content_scales<kQkN>(
+                params, physical_block_idx, idx_in_warpgroup
+            );
+            cute::warpgroup_wait<0>();
+            apply_qk_content_scales(rP, qk_scales, idx_in_warpgroup);
+        }
         QKT_GEMM_ONE_TILE(8);
         cur_phase ^= 1;
     }
@@ -256,6 +355,7 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
 
 template<
     typename T,
+    bool QK_NORM,
     typename Engine0, typename Layout0,
     typename Engine1, typename Layout1,
     typename Engine2, typename Layout2
@@ -264,13 +364,49 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm_no_pipeline(
     Tensor<Engine0, Layout0> &sQ,	// (BLOCK_SIZE_M, HEAD_DIM_K)
     Tensor<Engine1, Layout1> &sKV,	// (BLOCK_SIZE_M, HEAD_DIM_K)
     Tensor<Engine2, Layout2> &rP,	// ((2, 2, 8), 1, 1)
+    const DenseAttnDecodeParams &params,
+    int physical_block_idx,
+    int m_block_idx,
+    int k_head_idx,
     int idx_in_warpgroup
 ) {
     TiledMMA tiled_mma = (typename T::TiledMMA_QK_sQ){};
     ThrMMA thr_mma = tiled_mma.get_slice(idx_in_warpgroup);
     Tensor thr_mma_sQ = thr_mma.partition_fragment_A(sQ);	// (MMA, 1, 576/16=36)
     Tensor thr_mma_sKV = thr_mma.partition_fragment_B(sKV);	// (MMA, 1, 576/16=36)
-    gemm<true, -1>(tiled_mma, thr_mma_sQ, thr_mma_sKV, rP);
+    if constexpr (!QK_NORM) {
+        gemm<true, -1>(tiled_mma, thr_mma_sQ, thr_mma_sKV, rP);
+    } else {
+        warpgroup_fence_operand(rP);
+        warpgroup_arrive();
+        tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
+        CUTLASS_PRAGMA_UNROLL
+        for (int k_block = 0; k_block < T::HEAD_DIM_V / 16; ++k_block) {
+            cute::gemm(
+                tiled_mma, thr_mma_sQ(_, _, k_block),
+                thr_mma_sKV(_, _, k_block), rP
+            );
+            tiled_mma.accumulate_ = GMMA::ScaleOut::One;
+        }
+        warpgroup_commit_batch();
+        constexpr int kQkN = decltype(size(rP))::value / 4;
+        auto qk_scales = prefetch_qk_content_scales<kQkN>(
+            params, physical_block_idx, idx_in_warpgroup
+        );
+        cute::warpgroup_wait<0>();
+        apply_qk_content_scales(rP, qk_scales, idx_in_warpgroup);
+        warpgroup_arrive();
+        CUTLASS_PRAGMA_UNROLL
+        for (int k_block = T::HEAD_DIM_V / 16;
+             k_block < T::HEAD_DIM_K / 16; ++k_block) {
+            cute::gemm(
+                tiled_mma, thr_mma_sQ(_, _, k_block),
+                thr_mma_sKV(_, _, k_block), rP
+            );
+        }
+        warpgroup_commit_batch();
+        warpgroup_fence_operand(rP);
+    }
 }
 
 
@@ -723,6 +859,7 @@ __forceinline__ __device__ auto get_half_V(
 
 template<
     typename T,
+    bool QK_NORM,
     bool IS_BLK0_LAST,	// "BLK0" means block_idx+0, "BLK1" means block_idx+1, ...
     bool IS_BLK1_LAST,
     typename TMAParams,
@@ -813,7 +950,10 @@ __forceinline__ __device__ void wg0_subroutine(
     // Issue P0 = Q @ K0^T
     // Since TMAs for these 4 tiles are launched right after rO0 += rPb @ sV0L finishes, they should have already finished. Therefore, we issue the first 4 tiles to fill the pipeline.
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
-        warpgroup_cooperative_qkt_gemm<T, 0>(sQ, sK0, rP0, rQ8, barriers_K0, cur_phase_K0, idx_in_warpgroup);
+        warpgroup_cooperative_qkt_gemm<T, 0, QK_NORM>(
+            sQ, sK0, rP0, rQ8, barriers_K0, cur_phase_K0, params,
+            nxt_block0_index, blockIdx.x, blockIdx.y, idx_in_warpgroup
+        );
     }
 
     // Wait for rO0 += rPb @ sV1L, launch TMA
@@ -824,7 +964,10 @@ __forceinline__ __device__ void wg0_subroutine(
     
     // Issue P0 = Q @ K0^T
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
-        warpgroup_cooperative_qkt_gemm<T, 2>(sQ, sK0, rP0, rQ8, barriers_K0, cur_phase_K0, idx_in_warpgroup);
+        warpgroup_cooperative_qkt_gemm<T, 2, QK_NORM>(
+            sQ, sK0, rP0, rQ8, barriers_K0, cur_phase_K0, params,
+            nxt_block0_index, blockIdx.x, blockIdx.y, idx_in_warpgroup
+        );
     }
     
     // Wait for P0 = Q @ K0^T
@@ -834,6 +977,7 @@ __forceinline__ __device__ void wg0_subroutine(
 
 template<
     typename T,
+    bool QK_NORM,
     bool IS_BLK0_LAST,
     bool IS_BLK1_LAST,
     bool IS_BLK2_LAST,
@@ -934,7 +1078,10 @@ __forceinline__ __device__ void wg1_subroutine(
 
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST && !IS_BLK2_LAST) {
         // Issue rP1 = sQ @ sK1, wait
-        warpgroup_cooperative_qkt_gemm<T, 1>(sQ, sK1, rP1, rQ8, barriers_K1, cur_phase_K1, idx_in_warpgroup);
+        warpgroup_cooperative_qkt_gemm<T, 1, QK_NORM>(
+            sQ, sK1, rP1, rQ8, barriers_K1, cur_phase_K1, params,
+            nxt_block1_index, blockIdx.x, blockIdx.y, idx_in_warpgroup
+        );
     }
     
     // We put the `cute::warpgroup_wait<0>()` out of the `if` statement above, otherwise
@@ -956,7 +1103,7 @@ __forceinline__ __device__ int get_mask_len(const DenseAttnDecodeParams &params,
     }
 }
 
-template<typename T, typename TmaParams>
+template<typename T, bool QK_NORM, typename TmaParams>
 __global__ void __launch_bounds__(T::NUM_THREADS, 1, 1)
 flash_fwd_splitkv_mla_kernel(__grid_constant__ const DenseAttnDecodeParams params, __grid_constant__ const TmaParams tma_params) {
     // grid shape: [
@@ -1119,14 +1266,18 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const DenseAttnDecodeParams param
             
             // Issue P0 = Q @ K0^T, wait
             if (start_block_idx-16777216 < end_block_idx) {     // NOTE We use this `if` to prevent register spilling
-                warpgroup_cooperative_qkt_gemm_no_pipeline<T>(sQ, sK0, rP0, idx_in_warpgroup);
+                warpgroup_cooperative_qkt_gemm_no_pipeline<T, QK_NORM>(
+                    sQ, sK0, rP0, params,
+                    __ldg(block_table_ptr + start_block_idx), m_block_idx,
+                    k_head_idx, idx_in_warpgroup
+                );
             }
             // We add a barrier here, making sure that previous writes to sM are visible to warpgroup 0
             NamedBarrier::arrive_and_wait(128, NamedBarriers::sMInitialized);
             cute::warpgroup_wait<0>();
 
             #define LAUNCH_WG0_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST) \
-                wg0_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST>( \
+                wg0_subroutine<T, QK_NORM, IS_BLK0_LAST, IS_BLK1_LAST>( \
                     tma_gK, sQ, sK0, sK1, sP0, sP1, sM, sScale0, sScale1, \
                     rQ8, rP0, rO, rL, rRightBorderForQSeq, \
                     barriers_K0, barriers_K1, cur_phase_K0, \
@@ -1152,12 +1303,16 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const DenseAttnDecodeParams param
             
             if (start_block_idx+1 < end_block_idx) {
                 // Issue rP1 = sQ @ sK1, wait
-                warpgroup_cooperative_qkt_gemm<T, 1>(sQ, sK1, rP1, rQ8, barriers_K1, cur_phase_K1, idx_in_warpgroup);
+                warpgroup_cooperative_qkt_gemm<T, 1, QK_NORM>(
+                    sQ, sK1, rP1, rQ8, barriers_K1, cur_phase_K1, params,
+                    __ldg(block_table_ptr + start_block_idx + 1), m_block_idx,
+                    k_head_idx, idx_in_warpgroup
+                );
                 cute::warpgroup_wait<0>();
             }
 
             #define LAUNCH_WG1_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST) \
-                wg1_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST>( \
+                wg1_subroutine<T, QK_NORM, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST>( \
                     tma_gK, sQ, sK0, sK1, sP0, sP1, sM, sScale0, sScale1, \
                     rQ8, rP1, rO, rL, rRightBorderForQSeq, \
                     barriers_K0, barriers_K1, cur_phase_K1, \
@@ -1331,7 +1486,9 @@ void run_flash_splitkv_mla_kernel(DenseAttnDecodeParams &params) {
         shape_K, tma_K,
         shape_O, tma_O
     };
-    auto mla_kernel = &flash_fwd_splitkv_mla_kernel<T, decltype(tma_params)>;
+    auto mla_kernel = params.qk_norm_scale_ptr != nullptr
+        ? &flash_fwd_splitkv_mla_kernel<T, true, decltype(tma_params)>
+        : &flash_fwd_splitkv_mla_kernel<T, false, decltype(tma_params)>;
     constexpr size_t smem_size = sizeof(typename T::SharedMemoryPlan);
     CHECK_CUDA(cudaFuncSetAttribute(mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 

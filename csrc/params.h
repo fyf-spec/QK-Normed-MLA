@@ -31,6 +31,7 @@ struct DenseAttnDecodeParams { // TODO Change name to DenseAttnDecodeParams
     
     void *__restrict__ q_ptr;
     void *__restrict__ k_ptr;
+    float *__restrict__ qk_norm_scale_ptr;
     void *__restrict__ o_ptr;
     float *__restrict__ softmax_lse_ptr;
 
@@ -43,6 +44,8 @@ struct DenseAttnDecodeParams { // TODO Change name to DenseAttnDecodeParams
     index_t q_head_stride;
     index_t k_head_stride;
     index_t o_head_stride;
+    index_t qk_norm_scale_block_stride;  // stride over blocks   (== page_block_size)
+    index_t qk_norm_scale_row_stride;    // stride over tokens   (== 1, contiguous)
 
     int *__restrict__ block_table;
     index_t block_table_batch_stride;

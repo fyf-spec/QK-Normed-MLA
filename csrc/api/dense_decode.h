@@ -20,7 +20,8 @@ dense_attn_decode_interface(
     const float softmax_scale,
     bool is_causal,
     std::optional<at::Tensor> &tile_scheduler_metadata,   // num_sm_parts x (DecodingSchedMetaSize/4)
-    std::optional<at::Tensor> &num_splits                 // batch_size + 1
+    std::optional<at::Tensor> &num_splits,                // batch_size + 1
+    const std::optional<at::Tensor> &qk_norm_scale_cache  // num_blocks x num_heads_q x page_block_size, float32
 ) {
     // Check arch
     Arch arch = Arch();
@@ -43,6 +44,7 @@ dense_attn_decode_interface(
     KU_CHECK_DEVICE(block_table);
     KU_CHECK_DEVICE(tile_scheduler_metadata);
     KU_CHECK_DEVICE(num_splits);
+    KU_CHECK_DEVICE(qk_norm_scale_cache);
 
     // Check layout
     TORCH_CHECK(q.stride(-1) == 1, "q must have contiguous last dimension");
@@ -51,6 +53,7 @@ dense_attn_decode_interface(
     TORCH_CHECK(block_table.stride(-1) == 1, "block_table must have contiguous last dimension");
     KU_CHECK_CONTIGUOUS(tile_scheduler_metadata);
     KU_CHECK_CONTIGUOUS(num_splits);
+    KU_CHECK_CONTIGUOUS(qk_norm_scale_cache);
 
     const auto sizes = q.sizes();
     const int batch_size = sizes[0];
@@ -67,6 +70,16 @@ dense_attn_decode_interface(
     TORCH_CHECK(page_block_size == 64, "Currently page_block_size must be 64");
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(num_heads_q % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+    if (qk_norm_scale_cache.has_value()) {
+        TORCH_CHECK(qk_norm_scale_cache->dtype() == torch::kFloat32,
+                    "qk_norm_scale_cache must have dtype float32");
+        // Paper (arXiv 2606.16310): per-token per-KV-group key scalar alpha^k.
+        // MLA has G = num_heads_k = 1, so alpha^k is ONE scalar per token,
+        // SHARED across all q-heads -> layout [block, token], token contiguous
+        // (kernel coalesces two adjacent token scales into one float2 load).
+        // The per-head query scalar alpha^q is folded into q_content upstream.
+        KU_CHECK_SHAPE(*qk_norm_scale_cache, num_blocks, page_block_size);
+    }
     
     if (seqlen_q_ori == 1) { is_causal = false; }
     
@@ -140,6 +153,8 @@ dense_attn_decode_interface(
     // Set the pointers and strides.
     params.q_ptr = q.data_ptr();
     params.k_ptr = kcache.data_ptr();
+    params.qk_norm_scale_ptr = qk_norm_scale_cache.has_value()
+        ? qk_norm_scale_cache->data_ptr<float>() : nullptr;
     params.o_ptr = out.data_ptr();
     params.softmax_lse_ptr = lse.data_ptr<float>();
     // All stride are in elements, not bytes.
@@ -152,6 +167,13 @@ dense_attn_decode_interface(
     params.q_head_stride = q.stride(2);
     params.k_head_stride = kcache.stride(2);
     params.o_head_stride = out.stride(1);
+    if (qk_norm_scale_cache.has_value()) {
+        params.qk_norm_scale_block_stride = qk_norm_scale_cache->stride(0);  // page_block_size
+        params.qk_norm_scale_row_stride = qk_norm_scale_cache->stride(1);    // token, == 1
+    } else {
+        params.qk_norm_scale_block_stride = 0;
+        params.qk_norm_scale_row_stride = 0;
+    }
 
     params.block_table = block_table.data_ptr<int>();
     params.block_table_batch_stride = block_table.stride(0);

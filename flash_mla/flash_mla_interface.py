@@ -25,6 +25,7 @@ class FlashMLASchedMeta:
 
         extra_page_block_size: Optional[int]
         extra_topk: Optional[int]
+        qk_normed: bool
 
     have_initialized: bool = False
 
@@ -66,7 +67,8 @@ def flash_mla_with_kvcache(
     extra_k_cache: Optional[torch.Tensor] = None,
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
-    extra_topk_length: Optional[torch.Tensor] = None
+    extra_topk_length: Optional[torch.Tensor] = None,
+    qk_norm_scale_cache: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -88,6 +90,16 @@ def flash_mla_with_kvcache(
         attn_sink: Optional[torch.Tensor], (num_heads_q, ), torch.float32. If presented, the final output will be scaled by exp(lse) / (exp(lse) + exp(attn_sink)). Have no affect on the returned softmax_lse. +inf will cause the result to become 0.
         extra_k_cache and extra_indices_in_kvcache: If provided, will attend to these extra tokens in addition to those in k_cache and indices_in_kvcache. Their format requirements are the same as k_cache and indices_in_kvcache respectively.
         topk_length/extra_topk_length: (batch_size, ), torch.int32. If provided, only the leftmost topk_length indices will be processed. Useful when the actual topk for different queries are different so that we can save some computation, compared to masking.
+        qk_norm_scale_cache: Optional float32 tensor shaped
+                (num_blocks, page_block_size). For QK-Normed MLA this is the
+                paper's per-token per-KV-group key scalar alpha^k (arXiv
+                2606.16310); MLA has one KV group so a single scalar per token
+                is shared across all q-heads. It scales only the first
+                head_dim_v (content) dims of every QK dot product; the RoPE
+                dims and latent V remain unscaled. The per-head query scalar
+                alpha^q is folded into the content dims of `q` by the caller
+                (paper: absorbed into the query projection), so it is not
+                passed here.
     
     For DeepSeek V3, DeepSeek V3.1, and DeepSeek V3.2:
         head_dim should be 576 while head_dim_v should be 512.
@@ -132,6 +144,7 @@ def flash_mla_with_kvcache(
 
             extra_k_page_block_size,
             extra_topk,
+            qk_norm_scale_cache is not None,
         )
     else:
         # Check whether the input arguments are consistent with sched_meta
@@ -147,9 +160,11 @@ def flash_mla_with_kvcache(
         assert sched_meta.config.topk == topk, "sched_meta.config.topk must be equal to the last dim of indices_in_kvcache." + helper_msg
         assert sched_meta.config.extra_page_block_size == extra_k_page_block_size, "sched_meta.config.extra_page_block_size must be equal to the page_block_size of extra_k_cache." + helper_msg
         assert sched_meta.config.extra_topk == extra_topk, "sched_meta.config.extra_topk must be equal to the last dim of extra_indices_in_kvcache." + helper_msg
+        assert sched_meta.config.qk_normed == (qk_norm_scale_cache is not None), "sched_meta.config.qk_normed must match qk_norm_scale_cache." + helper_msg
 
     if topk is not None:
         # Sparse attention
+        assert qk_norm_scale_cache is None, "qk_norm_scale_cache is only supported by dense attention"
         assert not causal, "causal must be False when sparse attention is enabled"
         assert is_fp8_kvcache, "is_fp8_kvcache must be True when sparse attention is enabled"
         out, lse, new_tile_scheduler_metadata, new_num_splits = flash_mla_cuda.sparse_decode_fwd(
@@ -166,7 +181,8 @@ def flash_mla_with_kvcache(
             q, k_cache, head_dim_v,
             cache_seqlens, block_table,
             softmax_scale, causal,
-            sched_meta.tile_scheduler_metadata, sched_meta.num_splits
+            sched_meta.tile_scheduler_metadata, sched_meta.num_splits,
+            qk_norm_scale_cache
         )
     sched_meta.tile_scheduler_metadata = new_tile_scheduler_metadata
     sched_meta.num_splits = new_num_splits

@@ -10,3 +10,6 @@ compile_commands.json
 .cache
 /dev
 /.clangd
+runs/
+*.lock
+.flash_mla_build.lock
